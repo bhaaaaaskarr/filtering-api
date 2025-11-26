@@ -1,11 +1,16 @@
-from fastapi import APIRouter, HTTPException, Depends
-from fastapi.responses import JSONResponse
+
+# routers/invoice.py
+from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import JSONResponse, PlainTextResponse
 import requests
-from typing import Optional
+from typing import Optional, Dict, List
 
 from dependencies import get_api_key
 from models import InvoiceStatusRequest, ResponseSchema, InvoiceSchema
 from utils import normalize, parse_date, get_remark_and_status
+
+# NEW: import helper functions for Markdown
+from helper import derive_columns, to_markdown_dynamic, summary_markdown_dynamic
 
 router = APIRouter()
 
@@ -13,10 +18,20 @@ router = APIRouter()
 async def get_root():
     return {"message": "Welcome to the Invoice Status API!"}
 
-@router.post("/invoice/status", response_model=ResponseSchema, response_class=JSONResponse)
+@router.post(
+    "/invoice/status",
+    # Optional: remove response_model for multi-format (JSON + Markdown)
+    # response_model=ResponseSchema,
+    response_class=JSONResponse,
+)
 async def invoice_status(
     request_data: InvoiceStatusRequest,
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    # NEW: query params to control format & paging
+    format: str = Query("json", pattern="^(json|md)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=50),
+    max_cols: Optional[int] = Query(None, ge=1, le=50),
 ):
     def clean_param(param: Optional[str]) -> Optional[str]:
         if param is None or str(param).strip().lower() in ["none", "null", ""]:
@@ -39,7 +54,7 @@ async def invoice_status(
 
     data_api_url = "http://127.0.0.1:8001/data"
     try:
-        response = requests.get(data_api_url)
+        response = requests.get(data_api_url, timeout=30)
         response.raise_for_status()
         financial_data = response.json()
     except requests.exceptions.RequestException as e:
@@ -48,7 +63,7 @@ async def invoice_status(
             detail=f"Failed to connect to data API: {e}"
         )
 
-    invoices_out = []
+    invoices_out: List[Dict] = []
 
     # Case 1: Specific invoice
     if inv:
@@ -60,6 +75,8 @@ async def invoice_status(
         ]
 
         if not invoice_rows:
+            if format == "md":
+                return PlainTextResponse(content=f"**Invoice `{inv}` is under process**", media_type="text/plain")
             return JSONResponse(content=f"Invoice {inv} is under process")
             
         for row in invoice_rows:
@@ -84,12 +101,10 @@ async def invoice_status(
         _, status_first = get_remark_and_status(invoice_rows[0])
         amount_due_calc = il_amount - sp_amount
         if status_first == "Paid":
-            # Only sum IL amounts for paid invoices
             paid_amount = sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) 
                             for r in invoice_rows if normalize(r.get("Document type")) == "IL")
             due_amount = 0
         else:
-            # Keep current logic for due invoices
             il_amount = sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) 
                             for r in invoice_rows if normalize(r.get("Document type")) == "IL")
             sp_amount = sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) 
@@ -104,11 +119,18 @@ async def invoice_status(
             "Currency": currency
         }
 
+        # Markdown output (specific invoice)
+        if format == "md":
+            columns = derive_columns(invoices_out, max_cols=max_cols)
+            md = to_markdown_dynamic(invoices_out, columns, page=page, page_size=page_size)
+            md += summary_markdown_dynamic(summary)
+            return PlainTextResponse(content=md, media_type="text/plain")
+
         return {"invoices": invoices_out, "summary": summary}
 
     # Case 2: All invoices
     else:
-        account_invoices = {}
+        account_invoices: Dict[str, List[Dict]] = {}
         for row in financial_data:
             if (row.get("Account")) != (account):
                 continue
@@ -129,16 +151,16 @@ async def invoice_status(
             if not inv_no:
                 continue
             account_invoices.setdefault(inv_no, []).append(row)
+
+        invoices_out = []
         for inv_no, rows in account_invoices.items():
             il_amount = sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) for r in rows if normalize(r.get("Document type")) == "IL")
             sp_amount = sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) for r in rows if normalize(r.get("Document type")) == "SP")
             base_row = rows[0] if rows else {}
             remark, status = get_remark_and_status(base_row)
             if status == "Paid":
-            # For Paid invoices, ignore SP (same as summary logic)
                 amount_due = il_amount
             else:
-                # For Due invoices, keep IL - SP
                 amount_due = il_amount - sp_amount
 
             invoices_out.append({
@@ -169,12 +191,18 @@ async def invoice_status(
                 for inv_no, rows in account_invoices.items()
                 if get_remark_and_status(rows[0])[1] == "Due"
             ),
-
-            
             "total_paid_amount": sum(
-            sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) for r in rows if normalize(r.get("Document type")) == "IL")
-            for inv_no, rows in account_invoices.items()
-            if get_remark_and_status(rows[0])[1] == "Paid"),
-
+                sum(abs(float(r.get("Amount in Doc. Curr.") or 0)) for r in rows if normalize(r.get("Document type")) == "IL")
+                for inv_no, rows in account_invoices.items()
+                if get_remark_and_status(rows[0])[1] == "Paid"
+            ),
         }
+
+        # Markdown output (all invoices)
+        if format == "md":
+            columns = derive_columns(invoices_out, max_cols=max_cols)
+            md = to_markdown_dynamic(invoices_out, columns, page=page, page_size=page_size)
+            md += summary_markdown_dynamic(summary)
+            return PlainTextResponse(content=md, media_type="text/plain")
+
         return {"invoices": invoices_out, "summary": summary}
